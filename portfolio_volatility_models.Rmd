@@ -1,0 +1,1430 @@
+---
+title: "portfolio volatility models"
+author: "michael downs"
+date: "Aug 6, 2015"
+output: pdf_document
+---
+
+## introduction
+Before getting to problem 1, I'll introduce the output from two common functions that will be used repeatedly in the analysis. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+library(xts)
+library(impute)
+library(fUnitRoots)
+library(urca)
+library(quantmod)
+library(timeDate)
+library(lubridate)
+library(PerformanceAnalytics)
+
+#library(highfrequency)
+#library(TTR)
+#library(tseries)
+#library(caret)
+#library(mondate)
+#library(MTS)
+#library(timeSeries)
+#library(car)
+
+data=read.csv("~/Documents/Pers/Ed/Courses/stats242/homework/futures.csv")
+data[,1]=as.Date(data[,1],format="%Y-%m-%d")
+
+# finding, deleting NA row
+data=data[-dim(data)[1],]; sum(is.na(data))
+
+# add sp500 and tbill
+sp500=getSymbols("^GSPC",src="yahoo",from=data[1,1],
+           to=data[dim(data)[1],1],env=NULL)
+tbill=getSymbols("^IRX",src="yahoo",from=data[1,1],
+           to=data[dim(data)[1],1],env=NULL)
+
+data=as.xts(data[,-1],data[,1])
+tmp=cbind(sp500[,c(6,5)],tbill[,c(6,5)])
+colnames(tmp)=c("sp_p","sp_v","rf_p","rf_v")
+data=merge(data,tmp,all=c(FALSE,FALSE))
+
+priceCols=seq(2,48,2);volCols=seq(3,49,2)
+
+# intialize global variables
+rf_t=0.0001173 # based on 252 NYSE trading days / year i.e., 1.0001173^252=1.03
+amt=1000
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# pass this function price and vol series, it will run pacfs and format output 
+
+partial_autos=function(priceLst){
+
+     if(length(priceLst)<=3){
+          par(mfrow=c(length(priceLst),3))
+     } else par(mfrow=c(1,3))
+     
+     for(i in 1:length(priceLst)){
+          pacf(priceLst[[i]][,1],main=paste("series",i));
+          pacf(diff(priceLst[[i]][,1])[-1],main=paste0("diff(series ",i,")"));
+          try.rslt=try(pacf(diff(log(priceLst[[i]][,1]))[-1],
+                            main=paste0("diff(log(series ",i,"))")),silent=TRUE)
+          if(inherits(try.rslt,"try-error")){
+               # in needed, increment zero values to take logs
+               min.val=0.00001; tmp=priceLst[[i]][,1]+min.val
+               pacf(diff(log(tmp))[-1],main=paste0("diff(log(series ",i,"))"))
+          }
+     }
+}
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# pass this a return series, it will run adf and kpss tests and format output
+
+test_stationarity=function(rtrnLst,axis=NA){
+     result=as.data.frame(matrix(NA,length(rtrnLst),7))
+     names(result)=c("period","test type","adf pval","adf result",
+                     "test type","kpss pval","kpss result")
+     j=1
+     for(i in 1:length(rtrnLst)){
+          result[j,1]=axis[i]
+          result[j,2]="root"
+          
+          try.rslt=try((adfTest(as.numeric(rtrnLst[[i]]),
+                               lags=12,type="ct")@test$p.value),silent=TRUE)
+          if(inherits(try.rslt,"try-error")){result[j,3]=NA}
+          else{result[j,3]=adfTest(as.numeric(rtrnLst[[i]]),
+                               lags=12,type="ct")@test$p.value}
+          if(is.na(result[j,3])){result[j,4]="NA"}
+          else if(result[j,3]<0.1){"stationary"}
+          else{"not"}
+          result[j,5]="trend"
+          tmp=ur.kpss(as.numeric(rtrnLst[[i]]),lags="long",type="tau")
+          result[j,6]=tmp@teststat
+          result[j,7]=if(result[j,6]<tmp@cval[2]){"stationary"}else{"not"}
+          j=j+1
+     }
+     return(result)
+}
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+start.date=as.Date("2010-01-01")
+end.date=as.Date("2013-07-01")
+
+# function computes a month difference as a difference between two monnb's
+
+calc_mnths=function(start.date,end.date){
+     monnb=function(d){lt=as.POSIXlt(as.Date(d,origin="1900-01-01"));lt$year*12+lt$mon}
+     mondf=function(d1,d2){monnb(d2)-monnb(d1)}
+     mnths=mondf(start.date,end.date)+1
+}
+
+mnths=calc_mnths(start.date,end.date)
+
+```
+
+### establish benchmarks
+This function establishes the market and buy-hold benchmark portfolios. Results for Jul 2010-2013 shown in graphic below.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# function calculates pct change for a seris.
+
+calc_pct_chg=function(series,amt,type="diff()"){
+     z=as.numeric(series)
+     chg=diff(z)/z[-length(z)]
+     rslt=rep(0,dim(series)[1]);rslt[1]=amt
+     for(i in 2:length(z)){
+          rslt[i]=rslt[i-1]*(1+chg[i-1])
+     }
+     rslt=as.xts(rslt,index(series))
+     return(rslt)
+}
+
+mkt.vals=calc_pct_chg(data$sp_p[paste0(start.date,"/",end.date)],amt,"diff()")
+
+# function calculates the buy-and-hold alternative
+
+calc_bh=function(prices,amt){
+     inv.amt=amt/dim(prices)[2] # $ per stock
+     shares=inv.amt/prices[1,] # num shares per stock
+     for(n in 1:dim(prices)[1]){
+          eod.val=sum(as.numeric(prices[n,])*as.numeric(shares))
+          if(exists("bh.p")){bh.p=rbind(bh.p,eod.val)}
+          else{bh.p=eod.val}
+     }
+     bh.p=as.xts(bh.p,index(prices))
+     return(bh.p)
+}
+
+bh.vals=calc_bh(data[,priceCols][paste0(start.date,"/",end.date)],amt)
+
+par(mfrow=c(1,1))
+plot(mkt.vals,main="market vs. buy-hold portfolio",ylab="indexed value",
+     ylim=range(rbind(as.numeric(bh.vals),as.numeric(mkt.vals))))
+lines(bh.vals,col="red")
+legend("topleft",legend=c("market","24-stock, equal weight portfolio"),
+       lwd=2,cex=1,col=c("black","red"))
+
+```
+
+### calculate ratios
+This function standardizes inputs and calclation for sharpe, treynor and other ratios. It also calculates CAPM alpha. Output for the market and buy-hold portfolios appears below. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6} 
+
+calc_ratios=function(ra,rb,rf,ttl=NA){
+     result=rbind(SharpeRatio(ra,rf,p=0.95,FUN="StdDev",weights=NULL,annualize=FALSE), 
+                  TreynorRatio(ra,rb,rf,scale=252,modified = FALSE), 
+                  SortinoRatio(ra,rf,weights=NULL),
+                  CalmarRatio(ra,scale=252),
+                  InformationRatio(ra,rb,scale=252),
+                  CAPM.alpha(ra,rb,rf)
+                  )
+     rownames(result)=c("sharpe","treynor","sortino","calmar","information","capm alpha")
+     colnames(result)=ttl
+     return(result)
+}
+
+calc_ratios(diff(log(mkt.vals)),diff(log(data$sp_p)),rf_t,"market ratios")
+calc_ratios(diff(log(bh.vals)),diff(log(data$sp_p)),rf_t,"buy-hold ratios")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# Function enables comparisons between quantiles by plotting quantile perfmance graphics.
+
+plot_qntl_perf=function(inList){
+     par(mfrow=c(3,1))
+     for(i in 1:length(inList)){
+          if(exists("plot.tmp")){plot.tmp=cbind(plot.tmp,inList[[i]][,1])}
+          else{plot.tmp=inList[[i]][,1]}
+     }
+     plot(plot.tmp[,1],type="l",main="performance: all quantiles",ylim=range(plot.tmp))
+     for(i in 2:dim(plot.tmp)[2]){lines(plot.tmp[,i],col=i)}
+     legend("topleft",legend=c(1:dim(plot.tmp)[2]),lwd=2,cex=1,col=c(1:dim(plot.tmp)[2]))
+     
+     mn=paste0("performance: first (q1) and last (q",dim(plot.tmp)[2],") quantiles")
+     plot(plot.tmp[,1],type="l",main=mn,
+          ylim=range(cbind(plot.tmp[,1],plot.tmp[,dim(plot.tmp)[2]])))
+     lines(plot.tmp[,dim(plot.tmp)[2]],col="red")
+     legend("topleft",legend=c("first quartile","last quartile"),lwd=2,cex=1,col=c("black","red"))
+     
+     mn=paste0("performance: q",dim(plot.tmp)[2],"-q1 cummulative return (",
+               round(plot.tmp[dim(plot.tmp)[1],dim(plot.tmp)[2]]-
+                          plot.tmp[dim(plot.tmp)[1],1])," at end)")
+     plot(plot.tmp[,length(inList)]-plot.tmp[,1],type="l",main=mn)
+     abline(h=0,col="red",lwd=2)
+     rm(plot.tmp)
+     # if time, equity curve
+}
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# Function enables comparisons between quantiles portfolio and market and buy-hold portfolio by plotting return graphics.
+
+eval_returns=function(all.plot,mkt.vals,bh.vals,rf_t,start.date,end.date){
+     
+     bh.vals=bh.vals[paste0(start.date,"/",end.date)]
+     mkt.vals=mkt.vals[paste0(start.date,"/",end.date)]
+     
+     # only averages if you send it multiple series
+     for(i in 1:length(all.plot)){
+          if(i==1){
+               avg.eod.val=all.plot[[i]]$eod.vals[paste0(start.date,"/",end.date)]
+               grs.trades=all.plot[[i]]$trades[paste0(start.date,"/",end.date)]
+               net.states=all.plot[[i]]$states[paste0(start.date,"/",end.date)]
+               net.pnl=all.plot[[i]]$pnl[paste0(start.date,"/",end.date)]
+          }else{
+               avg.eod.val=avg.eod.val+all.plot[[i]]$eod.vals[paste0(start.date,"/",end.date)]
+               grs.trades=grs.trades+all.plot[[i]]$trades[paste0(start.date,"/",end.date)]
+               net.states=net.states+all.plot[[i]]$states[paste0(start.date,"/",end.date)]
+               net.pnl=net.pnl+all.plot[[i]]$pnl[paste0(start.date,"/",end.date)]
+          }
+     }
+     avg.eod.val=avg.eod.val/length(all.plot)
+     
+     # format graphics
+     par(mfcol=c(3,1))
+     plot(mkt.vals,main="portfolio values",ylim=range(rbind(avg.eod.val,bh.vals,mkt.vals)))
+     lines(avg.eod.val,col="blue")
+     lines(bh.vals,col="red")
+     legend("topleft",legend=c("market","quantiles (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     plot(net.states,main="states",type="l")
+     
+     plot(net.pnl,main="PNL",type="l")
+
+     port.ratios.val=calc_ratios(diff(log(avg.eod.val))[-1],
+                                 diff(log(mkt.vals))[-1],rf_t,"portfolio ratios")
+     bh.ratios=calc_ratios(diff(log(bh.vals))[-1],diff(log(mkt.vals))[-1],
+                           rf_t,"b-h ratios")
+     
+     port.val=avg.eod.val[dim(avg.eod.val)[1]];colnames(port.val)="portfolio value"
+     port.v.bh=avg.eod.val[dim(avg.eod.val)[1]]-as.numeric(bh.vals[dim(bh.vals)[1]])
+     colnames(port.v.bh)="portfolio vs. buy-hold"
+     port.pnl=net.pnl[dim(avg.eod.val)[1]];colnames(port.pnl)="portfolio profit/loss"
+     
+     rslt=list(port.val=port.val,
+               port.v.bh=port.v.bh,
+               port.pnl=port.pnl,
+               port.ratios.val=port.ratios.val,
+               #port.ratios.pnl=port.ratios.pnl,
+               bh.ratios=bh.ratios)
+     return(rslt)
+}
+     
+```
+
+## problem 1
+### 1.2
+The code for poblem 1 implements the ”price momentum” strategy described by Jegadeesh and Titman (2001). It can execute a specific strategy including date range, lookback period, hold period and number of quantiles. Or it can search over a grid using ranges for each. It buys on the first day of the month, sells on the last, and maintains each quantile's portfolio history. In "momentum" mode, problem 1, it builds quantile portfolios based price momentum over the lookback period. In volatility mode, problem 2, it builds quantile portfolios based on volatility (standard deviaion of returns) over the lookback period.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+momo_cntrl=function(m,start.date,mnths,exclude,lag,hold,qntls,
+                    amt=1000,cst=0.001,output="pnl",vrs="momo"){    
+     
+     for(l in 1:length(lag)){
+          for(h in 1:length(hold)){
+               for(q in 1:length(qntls)){
+                    qntl.rslt=momo_qntls(m,start.date,mnths,exclude,lag[l],hold[h],
+                                         qntls[q],amt,cst,output,vrs)
+                    if(output=="pnl"){
+                         pnl.rslt=matrix(NA,1,13)
+                         row.rslt=cbind(lag[l],hold[h],qntls[q],qntl.rslt) # future: add "vrs"
+                         pnl.rslt[1,c(1:length(row.rslt))]=row.rslt
+                         if(exists("mstr")){mstr=rbind(mstr,pnl.rslt)}
+                         else{mstr=pnl.rslt}
+                    }
+                    else{mstr=qntl.rslt}                         
+               }
+          }
+     }
+     return(mstr)
+}
+
+momo_qntls=function(m,start.date,mnths,exclude,lag,hold,qntls,amt,cst,output,vrs){
+     perf=list()
+     ports=list()
+     ctrs=list()
+     
+     for(i in 1:mnths){
+          cur.date=start.date
+          month(cur.date)=month(cur.date)+(i-1)
+          if(i==1 && !is.null(exclude)){
+               while(month(cur.date) %in% exclude){month(cur.date)=month(cur.date)+1}
+          }
+          lb.date=cur.date;month(lb.date)=month(lb.date)-lag
+          inv.date=cur.date;month(inv.date)=month(inv.date)+1
+          lb.rcds=m[paste0(lb.date,"/",cur.date-1)] # lookback period data
+          per.rcds=m[paste0(cur.date,"/",inv.date-1)] # investment period data
+          
+          # determine portfolio assignments
+          portAssign=rep(0,dim(lb.rcds)[2]) # length(lb.rtrn)
+          if(vrs=="momo"){
+               # calculate lookback return quantiles
+               lb.rtrn=(as.numeric(lb.rcds[dim(lb.rcds)[1],])-as.numeric(lb.rcds[1,]))/
+                    as.numeric(lb.rcds[1,])
+               
+               lb.rtrn.breaks=quantile(lb.rtrn,probs=seq(0,1,1/qntls))
+          
+               for(j in 1:(length(lb.rtrn.breaks)-1)){
+                    portAssign[which(lb.rtrn>=lb.rtrn.breaks[j])]=j
+               }
+          }
+          else if(vrs=="vol"){
+               # calculate lookback volatility quantiles
+               lb.vol=sapply(lb.rcds,sd)
+               
+               lb.vol.breaks=quantile(lb.vol,probs=seq(0,1,1/qntls))
+          
+               for(j in 1:(length(lb.vol.breaks)-1)){
+                    portAssign[which(lb.vol>=lb.vol.breaks[j])]=j
+               }
+          }
+          
+          # process transactions for each quantile
+          for(k in 1:(length(unique(portAssign)))){
+               # process sells
+               if(i==1){
+                    per.inv.amt=amt*(1-cst)
+                    toSell=dim(m)[2]/qntls
+               } # kludge
+               else{
+                    # get quantile-specific stored ledger and counters
+                    port.lgr=ports[[k]]
+                    ctr=ctrs[[k]]
+                    
+                    # determine proceeds from sells
+                    sale.proceeds=sum(port.lgr[ctr-hold,]*as.numeric(per.rcds[dim(per.rcds)[1],]))*(1-cst)
+                    per.inv.amt=sale.proceeds*(1-cst)
+                    toSell=sum(port.lgr[ctr-hold,]>0)
+               }
+               
+               # calc equal $ value investments
+               qtl.rcds=per.rcds[,portAssign==k]
+               stk.inv.amt=(per.inv.amt/length(qtl.rcds[1,]))*(1-cst)
+               shares=stk.inv.amt/qtl.rcds[1,]
+               
+               # update portfolio holdings
+               if(i==1){
+                    port.lgr=as.data.frame(matrix(0,mnths+hold,dim(m)[2]))
+                    colnames(port.lgr)=names(m)
+                    if(!(month(cur.date) %in% exclude)){
+                         for(w in 1:hold){
+                              postCols=which(names(port.lgr) %in% names(qtl.rcds))
+                              toBuy=as.numeric(shares)/hold
+                              for(z in 1:length(postCols)){port.lgr[w,postCols[z]]=toBuy[z]}
+                         }
+                    }
+                    ctr=hold+1
+               }else{
+                    postCols=which(names(port.lgr) %in% names(qtl.rcds))
+                    toBuy=as.numeric(shares)
+                    if(!(month(cur.date) %in% exclude)){
+                         for(z in 1:length(postCols)){port.lgr[ctr,postCols[z]]=toBuy[z]}
+                    }
+                    ctr=ctr+1
+               }
+               ports[[k]]=port.lgr
+               ctrs[[k]]=ctr
+               
+               # calc daily portfolio value
+               for(n in 1:dim(per.rcds)[1]){
+                    holdings=colSums(port.lgr[(ctr-hold):ctr,])
+                    eod.val=sum(as.numeric(per.rcds[n,])*holdings)
+                    if(exists("per.rtrns")){per.rtrns=rbind(per.rtrns,eod.val)}
+                    else{per.rtrns=eod.val}
+               }
+               # cool R re-formatting waste of time
+               rownames(per.rtrns)=c(1:dim(per.rtrns)[1]);colnames(per.rtrns)=c("eod.vals")
+               per.rtrns=as.data.frame(per.rtrns)
+               per.rtrns$states=0;per.rtrns$trades=0;per.rtrns$pnl=0 #per.rtrns$cash=0;
+               
+               # create transaction records
+               for (q in 1:(dim(per.rtrns)[1])){
+                    if(i==1 && q==1 && !(month(cur.date) %in% exclude)){
+                         per.rtrns$states[q]=per.inv.amt
+                         per.rtrns$trades[q]=length(toBuy)
+                         per.rtrns$pnl[q]=per.inv.amt-amt
+                    }
+                    else if(q==1 && !(month(cur.date) %in% exclude)){
+                         per.rtrns$states[q]=per.inv.amt
+                         per.rtrns$trades[q]=length(toBuy)
+                         per.rtrns$pnl[q]=per.rtrns$eod.vals[q]-amt # kludge s/b prior eod
+                    }
+                    else if(q>1 && q<dim(per.rtrns)[1]){
+                         per.rtrns$states[q]=per.rtrns$states[q-1]
+                         per.rtrns$trades[q]=0
+                         per.rtrns$pnl[q]=per.rtrns$pnl[q-1]
+                    }
+                    else if(q==dim(per.rtrns)[1]){
+                         per.rtrns$states[q]=-per.inv.amt
+                         per.rtrns$trades[q]=toSell
+                         # assuming we value pnl monthly when we make any sales
+                         per.rtrns$pnl[q]=per.rtrns$eod.vals[q]-amt
+                    }
+               }
+               per.rtrns=as.xts(per.rtrns,index(per.rcds))
+               if(i==1){perf[[k]]=per.rtrns}
+               else{perf[[k]]=rbind(perf[[k]],per.rtrns)}
+               rm(per.rtrns)
+          }
+     }
+     plot_qntl_perf(perf)
+     
+     if(output=="pnl"){
+          for(z in 1:qntls){
+               pnl=perf[[z]]$pnl[dim(perf[[z]])[1]]
+               if(exists("pnls")){pnls=cbind(pnls,pnl)}else{pnls=pnl}
+          }
+          return(pnls)
+     }
+     else if(output=="perf"){return(list(perf=perf))}
+     else if(output=="full"){return(list(perf=perf,ports=ports))}
+}
+
+```
+
+### 1.3.1
+#### 1.3.1.1 baseline model:
+The baseline strategy uses settings from the question stem building 4 quantile portfolios based on price momentum for the prior 6 months. It invests $1,000 in the highest momentum, 4th quantile, over a series of monthly purchases. It holds each purchase for 6 months. At the end of each month, it sells the purchase from 6 months prior and reinvests the proceeds in the current 4th quantile portfolio. 
+
+The strategy is marginally successful. Ealuated against the other quantile portfolios, quantile 4 comes in last, losing $578 vs. the quantile 1 portfolio. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# per stem
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=NULL,
+                     lag=6,
+                     hold=6,
+                     qntls=4,
+                     amt=1000,
+                     cst=0.001,
+                     output="perf")
+
+```
+
+While it earns a $112 profit, evaluated against the market and buy-hold strategies, quantile 4 comes in last losing $171 vs. the buy-hold portfolio. The graphics below show that 2010-2012 outperformance gives way to more dramatic 2012-2013 underperformance. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][4],mkt.vals,bh.vals,rf_t,start.date,end.date)
+print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+
+```
+
+Output below shows that, with the exception of the information ratio, this portfolio underperforms buy-hold across the board.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$bh.ratios)
+
+```
+
+In contrast, the 1st quantile maintains its 2010-2012 outperformance during the 2012-2013 period. It nets a $671 profit and beats the buy-hold portfolio by $388. Output below the graphics show that quantile 1 tops the buy-hold porfolio across all performance benchmarks.  
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][1],mkt.vals,bh.vals,rf_t,start.date,end.date)
+#print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+```
+
+Output below shows that quantile 1 tops the buy-hold porfolio across all performance benchmarks. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$bh.ratios)
+
+```
+
+#### 1.3.1.2 with/out january:
+Excluding January hurts baseline portfolio performance. Ealuated against the other quantile portfolios, quantile 4 comes in last, losing $354 vs. the quantile 1 portfolio.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+# non-Jan # data[.indexmon(data) %in% 1:12][,priceCols]
+
+start.date=as.Date("2009-12-01")
+mnths=calc_mnths(start.date,end.date)
+
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=1,
+                     lag=6,
+                     hold=6,
+                     qntls=4,
+                     amt=1000,
+                     cst=0.001,
+                     output="perf")
+
+```
+
+Without January, quantile 4 loses $96. Evaluated against the market and buy-hold strategies, quantile 4 comes in last losing $421 vs. the buy-hold portfolio. The graphics below show that 2012 negative inflection point has up to mid 2011. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][4],mkt.vals,bh.vals,rf_t,start.date,end.date)
+print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+
+```
+
+Output below shows that, now including information ratio, quantile 4 underperforms buy-hold across the board.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$port.ratios.pnl);print(mod.rslt$bh.ratios)
+
+```
+
+Buying just January reduced the loss by 40% ($230) suggesting a January-effect. The graphics below look at the effect for Jan 2010. The top graphic shows not only significant (5%) moves in some stock values in January, but also significantly different moves with some stocks gaining and other stocks losing. The second grapic indicates that, during 2010, the January effect ran from mid-December to mid-February. The third graphic shows that a few stocks gained disproportionately during that period. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+par(mfrow=c(3,1))
+a=colSums(data["2010-12-31"][,priceCols])
+b=colSums(data["2011-01-31"][,priceCols])
+barplot((b-a)/a,main="pct chg: 31 Dec 10 -> 31 Jan 11")
+
+plot(rowSums(data["2010-12/2011-01"][,priceCols]),main="price-weighted index change: 15 Dec 10 -> 15 Feb 11")
+#weekdays(as.Date("2010-12-15"));weekdays(as.Date("2011-02-15"))
+
+a=colSums(data["2010-12-15"][,priceCols])
+b=colSums(data["2011-02-15"][,priceCols])
+barplot((b-a)/a,main="pct chg: 15 Dec 10 -> 15 Feb 11")
+
+# if time, fix and create table. 
+
+```
+
+#### 1.3.1.3 capm
+Output below provided $\alpha$ values for various CAPM models ($r_{it}-r_f=\alpha_i + \beta_i(r_{mt}-r_f)+\epsilon_{it}$). The results arge less for a momentum effect and more for a reversal effect in  the sample data. 
+
+1. $\alpha$ for quantile 1 portfolio:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# capm alpha p1
+CAPM.alpha(diff(all.plot[[1]][[1]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+2. $\alpha$ for quantile 4 portfolio:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# capm alpha p4
+CAPM.alpha(diff(all.plot[[1]][[4]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+3. $\alpha$ for quantile 4 - quantile 1:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# capm alpha p4-p1
+CAPM.alpha(diff(all.plot[[1]][[4]][,1]-all.plot[[1]][[1]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+4. $\alpha$ for quantile 1 - quantile 4:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# capm q1-q4
+CAPM.alpha(diff(all.plot[[1]][[1]][,1]-all.plot[[1]][[4]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+### 1.3.2
+The code in this section implements Lewellen's 2002 method to identify and estimate the three sources of momentum. Specifically, for each month, it analyzes quantile portfolio holdings by: 1. evaluating autocorrelation via stationarity of the return series in the six months before purchase and the six months after purchase, 2. looking at correlations between stocks in the quantile porfolios and across quantile porfolios in six months before and after purchase, and 3. looking at the CAPM alpha for quantile stocks before and after purchase. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='hide',fig.height=6,fig.width=6}
+
+# per stem
+start.date=as.Date("2010-01-01")
+mnths=calc_mnths(start.date,end.date)
+
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=NULL,
+                     lag=6,
+                     hold=6,
+                     qntls=4,
+                     amt=1000,
+                     cst=0.001,
+                     output="full")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='hide',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][4],mkt.vals,bh.vals,rf_t,start.date,end.date)
+mod.rslt=eval_returns(all.plot[[1]][1],mkt.vals,bh.vals,rf_t,start.date,end.date)
+
+# if time, just do the q4-q1 thing
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# looking at stocks w/in and across the two portfolios over time
+
+lewellen=function(q1.hldgs,qN.hldgs,start.date,lag.per,hold.per,stock.prices,mkt.prices){
+     # format date object - need to put this in main function eventually
+     from.date=seq(as.Date(start.date),length=2,by=paste0("-",(lag.per-1)," months"))[2]
+     to.date=seq(as.Date(from.date),length=2,by=paste0("+",(dim(q1.hldgs)[1]-1)," months"))[2]
+     dt.indx=seq(as.Date(from.date),as.Date(to.date),by="months")
+     q1.hldgs=as.xts(q1.hldgs,dt.indx);qN.hldgs=as.xts(qN.hldgs,dt.indx)
+     
+     rep.ctr=1
+     for(i in lag.per:(dim(q1.hldgs)[1]-hold.per)){
+          # set date range
+          buy.date=as.Date(index(q1.hldgs))[i]
+          lb.date=as.Date(index(q1.hldgs))[i-(lag.per-1)]
+          lf.date=as.Date(index(q1.hldgs))[i+hold.per]
+          
+          # get price series for holdings during look back and holding periods
+          per.hldgs.q1=names(q1.hldgs)[q1.hldgs[i,]>0]
+          per.hldgs.qN=names(qN.hldgs)[qN.hldgs[i,]>0]
+          lb.prices.q1=stock.prices[paste0(lb.date,"/",buy.date)][,names(stock.prices) %in% per.hldgs.q1]
+          lf.prices.q1=stock.prices[paste0(buy.date,"/",lf.date)][,names(stock.prices) %in% per.hldgs.q1]
+          lb.prices.qN=stock.prices[paste0(lb.date,"/",buy.date)][,names(stock.prices) %in% per.hldgs.qN]
+          lf.prices.qN=stock.prices[paste0(buy.date,"/",lf.date)][,names(stock.prices) %in% per.hldgs.qN]
+          
+          # calculate lookback and look forward stationarity on simple return series
+          lb.station.q1=matrix(NA,2,dim(lb.prices.q1)[2])
+          rownames(lb.station.q1)=c("adf","kpss")
+          lb.station.qN=matrix(NA,2,dim(lb.prices.qN)[2])
+          rownames(lb.station.qN)=c("adf","kpss")
+          lf.station.q1=matrix(NA,2,dim(lb.prices.q1)[2])
+          rownames(lf.station.q1)=c("adf","kpss")
+          lf.station.qN=matrix(NA,2,dim(lb.prices.qN)[2])
+          rownames(lf.station.qN)=c("adf","kpss")
+          
+          for(s in 1:dim(lb.prices.q1)[2]){
+               qnt.stat=test_stationarity(list(diff(lb.prices.q1[,s])[-1],
+                                               diff(lb.prices.qN[,s])[-1],
+                                               diff(lf.prices.q1[,s])[-1],
+                                               diff(lf.prices.qN[,s])[-1]))
+               
+               lb.station.q1[1,s]=qnt.stat[1,3];lb.station.q1[2,s]=qnt.stat[1,6]
+               lb.station.qN[1,s]=qnt.stat[2,3];lb.station.qN[2,s]=qnt.stat[2,6]
+               lf.station.q1[1,s]=qnt.stat[3,3];lb.station.q1[2,s]=qnt.stat[3,6]
+               lf.station.qN[1,s]=qnt.stat[4,3];lb.station.q1[2,s]=qnt.stat[4,6]
+          }
+          
+          if(exists("lb.stat.mstr.q1")){lb.stat.mstr.q1=lb.stat.mstr.q1+lb.station.q1}
+          else{lb.stat.mstr.q1=lb.station.q1}
+          if(exists("lb.stat.mstr.qN")){lb.stat.mstr.qN=lb.stat.mstr.qN+lb.station.qN}
+          else{lb.stat.mstr.qN=lb.station.qN}
+          if(exists("lf.stat.mstr.q1")){lf.stat.mstr.q1=lf.stat.mstr.q1+lf.station.q1}
+          else{lf.stat.mstr.q1=lf.station.q1}
+          if(exists("lf.stat.mstr.qN")){lf.stat.mstr.qN=lf.stat.mstr.qN+lf.station.qN}
+          else{lf.stat.mstr.qN=lf.station.qN}
+          
+          # calculate lookback and look forward alphas
+          lb.alpha.q1=matrix(NA,1,dim(lb.prices.q1)[2]);rownames(lb.alpha.q1)=c("capm")
+          lb.alpha.qN=matrix(NA,1,dim(lb.prices.qN)[2]);rownames(lb.alpha.qN)=c("capm")
+          lf.alpha.q1=matrix(NA,1,dim(lb.prices.q1)[2]);rownames(lf.alpha.q1)=c("capm")
+          lf.alpha.qN=matrix(NA,1,dim(lb.prices.qN)[2]);rownames(lf.alpha.qN)=c("capm")
+          
+          mkt.vals.lb=calc_pct_chg(mkt.prices[paste0(lb.date,"/",buy.date)],amt,"diff()")
+          mkt.vals.lf=calc_pct_chg(mkt.prices[paste0(buy.date,"/",lf.date)],amt,"diff()")
+          
+          for(s in 1:dim(lb.prices.q1)[2]){          
+
+               lb.alpha.q1[1,s]=CAPM.alpha(diff(lb.prices.q1[,s]),
+                                           diff(mkt.vals.lb),rf_t)
+               
+               lb.alpha.qN[1,s]=CAPM.alpha(diff(lb.prices.qN[,s]),
+                                           diff(mkt.vals.lb),rf_t)
+               
+               lf.alpha.q1[1,s]=CAPM.alpha(diff(lf.prices.q1[,s]),
+                                           diff(mkt.vals.lf),rf_t)
+               
+               lf.alpha.qN[1,s]=CAPM.alpha(diff(lf.prices.qN[,s]),
+                                           diff(mkt.vals.lf),rf_t)
+          }
+          
+          if(exists("lb.alpha.mstr.q1")){lb.alpha.mstr.q1=lb.alpha.mstr.q1+lb.alpha.q1}
+          else{lb.alpha.mstr.q1=lb.alpha.q1}
+          if(exists("lb.alpha.mstr.qN")){lb.alpha.mstr.qN=lb.alpha.mstr.qN+lb.alpha.qN}
+          else{lb.alpha.mstr.qN=lb.alpha.qN}
+          if(exists("lf.alpha.mstr.q1")){lf.alpha.mstr.q1=lf.alpha.mstr.q1+lf.alpha.q1}
+          else{lf.alpha.mstr.q1=lf.alpha.q1}
+          if(exists("lf.alpha.mstr.qN")){lf.alpha.mstr.qN=lf.alpha.mstr.qN+lf.alpha.qN}
+          else{lf.alpha.mstr.qN=lf.alpha.qN}
+
+          # build lookback correlation matrix
+          lb.mtrx.q1=matrix(NA,dim(lb.prices.q1)[2],dim(lb.prices.q1)[2])
+          lb.mtrx.qN=matrix(NA,dim(lb.prices.qN)[2],dim(lb.prices.qN)[2])
+          lb.mtrx.both=matrix(NA,dim(lb.prices.q1)[2],dim(lb.prices.q1)[2])
+          
+          colnames(lb.mtrx.q1)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lb.mtrx.q1)=c(1:dim(lb.mtrx.q1)[2])
+          colnames(lb.mtrx.qN)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lb.mtrx.qN)=c(1:dim(lb.mtrx.q1)[2])
+          colnames(lb.mtrx.both)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lb.mtrx.both)=c(1:dim(lb.mtrx.q1)[2])
+          
+          for(j in 1:dim(lb.prices.q1)[2]){
+               for(k in 1:dim(lb.prices.q1)[2]){
+                    lb.mtrx.q1[j,k]=cor(lb.prices.q1[,j],lb.prices.q1[,k])
+                    lb.mtrx.qN[j,k]=cor(lb.prices.qN[,j],lb.prices.qN[,k])
+                    lb.mtrx.both[j,k]=cor(lb.prices.q1[,j],lb.prices.qN[,k])
+               }
+          }
+          
+          # build look forward correlation matrix
+          lf.mtrx.q1=matrix(NA,dim(lf.prices.q1)[2],dim(lf.prices.q1)[2])
+          lf.mtrx.qN=matrix(NA,dim(lf.prices.qN)[2],dim(lf.prices.qN)[2])
+          lf.mtrx.both=matrix(NA,dim(lf.prices.q1)[2],dim(lf.prices.q1)[2])
+          
+          colnames(lf.mtrx.q1)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lf.mtrx.q1)=c(1:dim(lb.mtrx.q1)[2])
+          colnames(lf.mtrx.qN)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lf.mtrx.qN)=c(1:dim(lb.mtrx.q1)[2])
+          colnames(lf.mtrx.both)=c(1:dim(lb.mtrx.q1)[2])
+          rownames(lf.mtrx.both)=c(1:dim(lb.mtrx.q1)[2])
+          
+          for(j in 1:dim(lf.prices.q1)[2]){
+               for(k in 1:dim(lf.prices.q1)[2]){
+                    lf.mtrx.q1[j,k]=cor(lf.prices.q1[,j],lf.prices.q1[,k])
+                    lf.mtrx.qN[j,k]=cor(lf.prices.qN[,j],lf.prices.qN[,k])
+                    lf.mtrx.both[j,k]=cor(lf.prices.q1[,j],lf.prices.qN[,k])
+               }
+          }
+          if(exists("lb.mstr.q1")){lb.mstr.q1=lb.mstr.q1+lb.mtrx.q1}
+          else{lb.mstr.q1=lb.mtrx.q1}
+          if(exists("lb.mstr.qN")){lb.mstr.qN=lb.mstr.qN+lb.mtrx.qN}
+          else{lb.mstr.qN=lb.mtrx.qN}
+          if(exists("lb.mstr.both")){lb.mstr.both=lb.mstr.both+lb.mtrx.both}
+          else{lb.mstr.both=lb.mtrx.both}
+          
+          if(exists("lf.mstr.q1")){lf.mstr.q1=lf.mstr.q1+lf.mtrx.q1}
+          else{lf.mstr.q1=lf.mtrx.q1}
+          if(exists("lf.mstr.qN")){lf.mstr.qN=lf.mstr.qN+lf.mtrx.qN}
+          else{lf.mstr.qN=lf.mtrx.qN}
+          if(exists("lf.mstr.both")){lf.mstr.both=lf.mstr.both+lf.mtrx.both}
+          else{lf.mstr.both=lf.mtrx.both}
+          
+          rep.ctr=rep.ctr+1
+     }
+     
+     lb.alpha.mstr.q1=lb.alpha.mstr.q1/rep.ctr
+     lb.alpha.mstr.qN=lb.alpha.mstr.qN/rep.ctr
+     lf.alpha.mstr.q1=lf.alpha.mstr.q1/rep.ctr
+     lf.alpha.mstr.qN=lf.alpha.mstr.qN/rep.ctr
+     
+     lb.stat.mstr.q1=lb.stat.mstr.q1/rep.ctr
+     lb.stat.mstr.qN=lb.stat.mstr.qN/rep.ctr
+     lf.stat.mstr.q1=lf.stat.mstr.q1/rep.ctr
+     lf.stat.mstr.qN=lf.stat.mstr.qN/rep.ctr
+     
+     lb.mstr.q1=lb.mstr.q1/rep.ctr
+     lb.mstr.qN=lb.mstr.qN/rep.ctr
+     lb.mstr.both=lb.mstr.both/rep.ctr
+     lf.mstr.q1=lf.mstr.q1/rep.ctr
+     lf.mstr.qN=lf.mstr.qN/rep.ctr
+     lf.mstr.both=lf.mstr.both/rep.ctr
+     
+     return(list(lb.mstr.q1=lb.mstr.q1,
+                 lb.mstr.qN=lb.mstr.qN,
+                 lb.mstr.both=lb.mstr.both,
+                 lf.mstr.q1=lf.mstr.q1,
+                 lf.mstr.qN=lf.mstr.qN,
+                 lf.mstr.both=lf.mstr.both,
+                 lb.stat.mstr.q1=lb.stat.mstr.q1,
+                 lb.stat.mstr.qN=lb.stat.mstr.qN,
+                 lf.stat.mstr.q1=lf.stat.mstr.q1,
+                 lf.stat.mstr.qN=lf.stat.mstr.qN,
+                 lb.alpha.mstr.q1=lb.alpha.mstr.q1,
+                 lb.alpha.mstr.qN=lb.alpha.mstr.qN,
+                 lf.alpha.mstr.q1=lf.alpha.mstr.q1,
+                 lf.alpha.mstr.qN=lf.alpha.mstr.qN))
+}
+
+corrs=lewellen(all.plot[[2]][[1]],
+         all.plot[[2]][[4]],
+         start.date,
+         lag=6,
+         hold=6,
+         data[,priceCols],
+         data$sp_p)
+
+a=corrs[[1]];a=cbind(a,corrs[[2]]);a=cbind(a,corrs[[3]])
+b=corrs[[4]];b=cbind(b,corrs[[5]]);b=cbind(b,corrs[[6]])
+d=rbind(a,b);#d=scale(d)
+
+```
+
+#### using the 1.3.1.1 baseline model:
+Results are based on the model from 1.3.1.1 that revealed stark underperformance of quantile 4 vs. quantile 1.
+
+##### auto-correlation
+The graphics below show autocorrelation in the quantile 1 and quantile 4 price series, but that it may be eliminated in the simple and log return series.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# find auto-correlation in the price series, but not the return series for the two portfolios
+partial_autos(list(all.plot[[1]][[1]][,1],all.plot[[1]][[4]][,1]))
+
+```
+
+The table below shows dickey-fuller / kpss test results for the simple return series indicating that autocorrelation can be removed at the portfolio level.  
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# find simple return series are stationary
+test_stationarity(list(diff(all.plot[[1]][[1]][,1])[-1],
+                       diff(all.plot[[1]][[4]][,1])[-1]),
+                  c("quantile 1","quantile 4"))
+
+```
+
+However, it is not removed at the individual stock level. The output below shows the average dickey-fuller and kpss p-values applied to individual holdings for quantile 1 (top) and quantile 4 (bottom) in the period leading up to purchase. While these results are not sufficient to prove that higher or lower levels of autocorrelation are associated with outperformance, they do show that stock return autocorrelation existed before purchase. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+mean(corrs[[7]][1,]);mean(corrs[[7]][2,])
+mean(corrs[[8]][1,]);mean(corrs[[8]][2,])
+
+```
+
+The output below shows average df and kpss values for quantile 1 and quantile 4 during the period following purchase. They indicate that autocorrelation in simple returns were persistent. Further, they indicate some separation in the magnitude of autocorrelation between the higher performing quantile 1 and quantile 4.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+mean(corrs[[9]][1,]);mean(corrs[[9]][2,])
+mean(corrs[[10]][1,]);mean(corrs[[10]][2,])
+
+```
+
+##### correlation
+The output below serves as a baseline for stock correlations discussed below. Here is the correlation between prices of quantile 1 and quantile 4:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+# find correlation between the two price series
+cor(as.numeric(all.plot[[1]][[1]][,1]),as.numeric(all.plot[[1]][[4]][,1]))
+
+```
+
+Here are the average correlations between prices of stocks in the quantile 1 (top) and quantile 4 (bottom) portfolios in the period before purchase. Note that the intra-portfolio correlations bracket the inter-portfolio correlation above indicating the correlations are not significant.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+heatmap(d[1:6,1:6],Rowv=NA,Colv=NA,
+        main=paste("q1 back cor:",round(mean(corrs[[1]]),2)))
+heatmap(d[1:6,7:12],Rowv=NA,Colv=NA,
+        main=paste("q4 back cor:",round(mean(corrs[[2]]),2)))
+
+```
+
+However, when we look at stock-by-stock correlations between holdings of quantile 1 and quantile 4 over time, we see much lower correlations. This ratifies part of Lewellen's hypothesis. That is, portfolio level values mask the extent of correlation going on inside quantile portfolios. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+heatmap(d[1:6,13:18],Rowv=NA,Colv=NA,
+        main=paste("q1:N back cor",round(mean(corrs[[3]]),2)))
+
+```
+
+Here are the same three sets of correlations for the post-purchase period. I'll note only that the high level of intra-portfolio correlations for quantile 4 have declined moderately.  
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+heatmap(d[6:12,1:6],Rowv=NA,Colv=NA,
+        main=paste("q1 fwd cor:",round(mean(corrs[[4]]),2)))
+heatmap(d[7:12,7:12],Rowv=NA,Colv=NA,
+        main=paste("qN fwd cor:",round(mean(corrs[[5]]),2)))
+heatmap(d[7:12,13:18],Rowv=NA,Colv=NA,
+        main=paste("q1:N fwd cor:",round(mean(corrs[[6]]),2)))
+
+```
+
+##### unconditional mean
+Here are the quantile 1 (top) and quantile 4 (bottom) portfolio simple return alphas. As previously mentioned, quartile 1's alpha is consistent with its outperformance. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+CAPM.alpha(diff(all.plot[[1]][[1]][,1]),diff(mkt.vals),rf_t)
+CAPM.alpha(diff(all.plot[[1]][[4]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+Here are the average alphas for quartile 1 and quartile 4 stocks in the period prior to purchase. Interestingly, quartile 1, which outperformed subsequently, has lower (even negative) average alpha values. Further, these shorter duration, stock-specific alpha averages are opposite those take at the portfolio level over the entire term above. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+mean(corrs[[11]])
+mean(corrs[[12]])
+
+```
+
+Looking at the post-purchase period, the picture is less clear as the alpha values (which likely contributed to quantile construction) have decreased. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+mean(corrs[[13]])
+mean(corrs[[14]])
+
+```
+
+#### using a "best fit" model
+The results below are based on a strategy that "works" for the original question (i.e., results in a quantile N portfolio that shows less mean reversion and more 1. quantile N profit, 2. quantile N- quantile 1 outperformance). With a 4-month lookback, a 1-month hold and 8 quantiles, that strategy is closer to the data.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+start.date=as.Date("2009-12-01")
+mnths=calc_mnths(start.date,end.date)
+
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=NULL,
+                     lag=4,
+                     hold=1,
+                     qntls=8,
+                     amt=1000,
+                     cst=0.001,
+                     output="full")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='hide',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][8],mkt.vals,bh.vals,rf_t,start.date,end.date)
+
+```
+
+That strategy is more profitable with quantile 8 generating a $1,292 profit, beating quantile 1 by $471, and beating b-h by $1,023. It also beats b-h across all performance ratios. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$bh.ratios)
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+corrs=lewellen(all.plot[[2]][[1]],
+         all.plot[[2]][[8]],
+         start.date,
+         lag=4,
+         hold=1,
+         data[,priceCols],
+         data$sp_p)
+
+a=corrs[[1]];a=cbind(a,corrs[[2]]);a=cbind(a,corrs[[3]])
+b=corrs[[4]];b=cbind(b,corrs[[5]]);b=cbind(b,corrs[[6]])
+d=rbind(a,b);#d=scale(d)
+
+```
+
+##### correlation
+Correlations between quantile 1 and quantile 8 at the portfoio level are high:
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+# find correlation between the two price series
+cor(as.numeric(all.plot[[1]][[1]][,1]),as.numeric(all.plot[[1]][[8]][,1]))
+
+```
+
+Intra-quantile look back correlations are high and intra-quantile look back correlations are low:
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+heatmap(d[1:3,1:3],Rowv=NA,Colv=NA,
+        main=paste("q1 back cor:",round(mean(corrs[[1]]),2)))
+heatmap(d[1:3,4:6],Rowv=NA,Colv=NA,
+        main=paste("qN back cor:",round(mean(corrs[[2]]),2)))
+heatmap(d[1:3,7:9],Rowv=NA,Colv=NA,
+        main=paste("q1:N back cor",round(mean(corrs[[3]]),2)))
+
+```
+
+Further, those intra- and inter-quantile correlations hold up into the (now-shortened to 1 month) future:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+heatmap(d[4:6,1:3],Rowv=NA,Colv=NA,
+        main=paste("q1 fwd cor:",round(mean(corrs[[4]]),2)))
+heatmap(d[4:6,4:6],Rowv=NA,Colv=NA,
+        main=paste("qN fwd cor:",round(mean(corrs[[5]]),2)))
+heatmap(d[4:6,7:9],Rowv=NA,Colv=NA,
+        main=paste("q1:N fwd cor:",round(mean(corrs[[6]]),2)))
+
+```
+
+##### unconditional mean
+Here are the quantile 1 (top) and quantile 8 (bottom) portfolio simple return alphas. Quartile 8's alpha is consistent with its outperformance as posited by Lewellen.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+CAPM.alpha(diff(all.plot[[1]][[1]][,1]),diff(mkt.vals),rf_t)
+CAPM.alpha(diff(all.plot[[1]][[8]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+Here are the average alphas for quartile 1 and quartile 8 stocks in the period prior to purchase. This time the alphas are in line with expectations based on the performance of the portfolios:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+mean(corrs[[11]])
+mean(corrs[[12]])
+
+```
+
+Likewise the post-purchase average for stock-level alphas are in line with outperformance:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+mean(corrs[[13]])
+mean(corrs[[14]])
+
+```
+
+The results above are generally supportive of Lewellen's assertions about the presence of autocorrelation, correlation and unconditional mean in quantile portfolios. Also, his findings relative to positive autocorrelation in winner portfolios is supported here. His assertion that stock returns are negatively correlated with lagged returns of other stocks are less conclusively supported here. While in both tests the forward and backward scenarios showed high intra-portfolio correlations and low or negative inter-portfolio correlations, there was no clear trend distinguishing winners from losers. Finally, his assertion that high alpha leads to outperformance is supported at the aggregate, portfolio, level. However, the benefit of having high average alpha stocks in the portfolio was less clear. 
+
+## problem 2
+
+### 2.2
+The code in this section implements volatility quantile portfolio construction proposed by Han, Yang and Zhou (2013). The first portfolio below covers a lag of 6 months, a hold period of 6 months and 4 quantiles. Quantile portfolios are formed on the last day of each month based on past 6 month variance in the returns. Quantile 1 contains stocks with the lowest past six-month volatilities. 
+
+### 2.3
+#### 2.3.a (1.3.1 strategy profits):
+The result is a significant improvement over problem 1. While quantile 4 finishes second to last, it beats quantile 1 by $230. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+start.date=as.Date("2010-01-01")
+mnths=calc_mnths(start.date,end.date)
+
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=NULL,
+                     lag=6,
+                     hold=6,
+                     qntls=4,
+                     amt=1000,
+                     cst=0.001,
+                     output="full",
+                     vrs="vol")
+
+```
+
+However, while quantile 4 makes $218, it loses to both the market and buy-hold. The latter loss is $50.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][4],mkt.vals,bh.vals,rf_t,start.date,end.date)
+print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+```
+
+Further, performance ratios show quantile 4 to be universally worse than the buy-hold portfolio. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$bh.ratios)
+
+# update momo_ for cur price above ma price if time. 1st across months. 
+# later a separate function iterating thru to spot 10-ish day move.
+
+```
+
+Finding the best model from a grid search results in significant improvement and leads to interesting insights. Mid-volatiliy portfolios ramped starting in July 2012 outperforming both low- and high-volatility portfolios. That is, 4th and 5th quantiles performed best overall, particularly when there were two or more quantiles above. The best "high-volatility" model, therefore, got as much mid-volatility as it could under the constraints of the algorithm. The result was an optimal porfolio with 5 month lag, 1 month hold and only 2 quantiles. 
+
+That quantile 2 portfolio netted $938 over quantile 1. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+all.plot= momo_cntrl(m=data[,priceCols],
+                     start.date=start.date,
+                     mnths=mnths,
+                     exclude=NULL,
+                     lag=5,
+                     hold=1,
+                     qntls=2,
+                     amt=1000,
+                     cst=0.001,
+                     output="full",
+                     vrs="vol")
+
+# best exclude=NULL (lag=5,hold=1,qntls=2), $1,071 profit, +$788 vs. buy-hold, +$938 vs. quantile 1. much more responsive portfolio.
+
+```
+
+It had an overall profit of $1,071 beating the b-h portfolio by $803. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+mod.rslt=eval_returns(all.plot[[1]][2],mkt.vals,bh.vals,rf_t,start.date,end.date)
+print(mod.rslt$port.val);print(mod.rslt$port.pnl);print(mod.rslt$port.v.bh)
+
+```
+
+Further, it beat the b-h portfolio across all performance metrics. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+print(mod.rslt$port.ratios.val);print(mod.rslt$bh.ratios)
+
+```
+
+#### 2.3.a (1.3.2 decomposing profits)
+Results are based on the "best fit" above. 
+
+##### auto-correlation
+The graphics below show autocorrelation in the quantile 1 and quantile 2 price series, but that it may be eliminated in the simple and log return series.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# find auto-correlation in the price series, but not the return series for the two portfolios
+partial_autos(list(all.plot[[1]][[1]][,1],all.plot[[1]][[2]][,1]))
+
+```
+
+The table below shows dickey-fuller / kpss test results for the simple return series indicating that autocorrelation can be removed at the portfolio level.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# find simple return series are stationary
+test_stationarity(list(diff(all.plot[[1]][[1]][,1])[-1],
+                       diff(all.plot[[1]][[2]][,1])[-1]),
+                  c("quantile 1","quantile 2"))
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+corrs=lewellen(all.plot[[2]][[1]],
+         all.plot[[2]][[2]],
+         start.date,
+         lag=5,
+         hold=1,
+         data[,priceCols],
+         data$sp_p)
+
+a=corrs[[1]];a=cbind(a,corrs[[2]]);a=cbind(a,corrs[[3]])
+b=corrs[[4]];b=cbind(b,corrs[[5]]);b=cbind(b,corrs[[6]])
+d=rbind(a,b);#d=scale(d)
+
+```
+
+However, it is not removed at the individual stock level. The output below shows the average dickey-fuller and kpss p-values applied to individual holdings for quantile 1 (top 2) and quantile 2 (bottom 2) in the period leading up to purchase. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+mean(corrs[[7]][1,]);mean(corrs[[7]][2,])
+mean(corrs[[8]][1,]);mean(corrs[[8]][2,])
+
+```
+
+##### correlation
+The output below serves as a baseline for stock correlations discussed below. Here is the correlation between prices of quantile 1 and quantile 2:
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+# find correlation between the two price series
+cor(as.numeric(all.plot[[1]][[1]][,1]),as.numeric(all.plot[[1]][[2]][,1]))
+
+```
+
+Here are the average correlations between prices of stocks in the quantile 1 (top) and quantile 2 (bottom) portfolios in the period before purchase. Note these correlations are lower than those seen with the momentum strategy alone.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+heatmap(d[1:2,1:2],Rowv=NA,Colv=NA,
+        main=paste("q1 back cor:",round(mean(corrs[[1]]),2)))
+heatmap(d[1:2,3:4],Rowv=NA,Colv=NA,
+        main=paste("q4 back cor:",round(mean(corrs[[2]]),2)))
+
+```
+
+However, when we look at average stock-by-stock correlations between holdings of quantile 1 and quantile 4 over time, we see much lower correlations. This ratifies part of Lewellen's hypothesis. That is, portfolio level values mask the extent of correlation going on inside quantile portfolios. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+heatmap(d[1:2,5:6],Rowv=NA,Colv=NA,
+        main=paste("q1:N back cor",round(mean(corrs[[3]]),2)))
+
+```
+
+##### unconditional mean
+Here are the quantile 1 (top) and quantile 2 (bottom) portfolio simple return alphas. Quartile 2's alpha is consistent with its outperformance. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+CAPM.alpha(diff(all.plot[[1]][[1]][,1]),diff(mkt.vals),rf_t)
+CAPM.alpha(diff(all.plot[[1]][[2]][,1]),diff(mkt.vals),rf_t)
+
+```
+
+When we dig down into average alphas for quartile 1 and quartile 2 stocks in the period prior to purchase, the picture is less clear. While the winning quartile 2 has a higer alpha, the alpha itself is less than seen in momentum portfolios.  
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3,fig.width=3}
+
+mean(corrs[[11]])
+mean(corrs[[12]])
+
+```
+
+#### 2.3.b
+These results generally support corss-sectional profitability assertions made by Han, Yang and Zhou (2013). Specifically, it appears tha application of moving averages to portfolios sorted by volatiity does generate timing portfolios that outperform buy-hold. Further, their assertion that the the strategy results in quantile portfolios with little risk exposure to Fama French or CAPM market factors while not conclusively proven is consistent with the relatively low alphas in these results. Finally, their assertion that the approach has little correlation with momentum models is generally supported by the, relatively, low autocorrelations and correlations in resulting quantile portfolios.
+
+
+### problem 3
+
+Yes. Volume information does provide value. After finding the stationary price and volume series, I fit two moving average models below. The first one finds optimum settings based on price alone. Using a 10 day lookback, a moving average weight of 1.01 and a max 2 day holding period, that model grosses $47,000. 
+
+The second model uses the same settings, but doubles trades when the most recent volume change is greater than 1.8 standard deviations from its recent (10-day) mean. That model nets $60,000.
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+es.p=data$es_p
+es.vol=data$es_v
+
+# find stationary series
+partial_autos(list(es.p,es.vol))
+test_stationarity(list(diff(log(es.p))[-1],diff(log(es.vol))[-1]),c("price","volume"))
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+gen_ma_w=function(m,l=NULL,w=NULL,h=NULL,rslt="pnl"){
+     if(is.null(l)){l=seq(2,10,1)}
+     if(is.null(w)){w=seq(0.95,1.1,0.02)}
+     if(is.null(h)){h=seq(1,2,1)}
+     amt=100
+     
+     for(i in 1:length(l)){
+          for(j in 1:length(w)){
+               for(k in 1:length(h)){
+                    gl=ma_w(m[,1],l[i],w[j],h[k],amt,rslt)
+                    rslt=cbind(l[i],w[j],h[k],gl)
+                    if(exists("mstr")){mstr=rbind(mstr,rslt)}else{mstr=rslt}
+               }
+          }
+     }
+     return(mstr)
+}
+
+ma_w=function(ARseries,l,w,h,amount,rslt){
+     rtrn=as.data.frame(coredata(ARseries))
+     rtrn$states=0
+     rtrn$PNL=0
+     rtrn$cash=0
+     rtrn$trades=0
+    
+    isAroundMean <- 1
+    for (i in l:dim(rtrn)[1]){
+         mu=mean(ARseries[(i-(l-1)):i])
+
+         score=0
+         if(ARseries[i]>(mu*w)) score=-1
+         else if(ARseries[i]<((1/w)*mu)) score=1
+
+        #3 conditions of whether to trade or not
+        if (i > l){rtrn$states[i]=rtrn$states[i-1]}
+        if (isAroundMean && (i==l||rtrn$states[i-1]==0)) {
+            if (abs(score) == 1) rtrn$trades[i]=1
+            if (score == 1) rtrn$states[i]=amount
+            else if (score == -1) rtrn$states[i]=-amount
+          }
+        else if (rtrn$states[i-h]!=0){
+              if(abs(score)!=1){
+                   rtrn$trades[i]=1
+                   rtrn$states[i]=0
+              }
+         }
+        #update cash and PNL
+        if (i==l) rtrn$cash[i] <- 500 - ARseries[i] * rtrn$states[i]
+        else rtrn$cash[i] <- rtrn$cash[i-1] - ARseries[i] * (rtrn$states[i] - rtrn$states[i-1])
+        rtrn$PNL[i] <- rtrn$cash[i] + rtrn$states[i] * ARseries[i]
+        if (abs(score) <= 1) isAroundMean <- 1
+        else isAroundMean <- 0
+    }
+    if(rslt=="plot"){
+         return(rtrn)
+         #list(ARseries = ARseries, trades = trades, 
+         #     states = states, cash = cash, PNL = PNL)
+    }
+    else{
+         return(rtrn$PNL[i])
+    }
+}
+
+#es.ma=gen_ma_w(cbind(es.p,es.vol)[paste0(start.date,"/",end.date)])
+#es.bst=es.ma[which.max(es.ma[,4]),];es.bst #ma=10, w=1.01, h=2, pnl=47,720
+es.ma.plot=ma_w(cbind(es.p,es.vol)[paste0(start.date,"/",end.date)],l=10,w=1.01,h=2,100,rslt="plot")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+gen_ma_w_v=function(m,l=NULL,w=NULL,h=NULL,rslt="pnl",vrs=NULL){
+     if(is.null(l)){l=seq(2,10,1)}
+     if(is.null(w)){w=seq(0.95,1.1,0.02)}
+     if(is.null(h)){h=seq(1,2,1)}
+     amt=100
+     
+     for(i in 1:length(l)){
+          for(j in 1:length(w)){
+               for(k in 1:length(h)){
+                    gl=ma_w_v(m,l[i],w[j],h[k],amt,rslt,vrs)
+                    rslt=cbind(l[i],w[j],h[k],gl)
+                    if(exists("mstr")){mstr=rbind(mstr,rslt)}else{mstr=rslt}
+               }
+          }
+     }
+     return(mstr)
+}
+
+ma_w_v=function(m,l,w,h,amount,rslt,vrs){
+     rtrn=as.data.frame(coredata(m))
+     rtrn$states=0
+     rtrn$PNL=0
+     rtrn$cash=0
+     rtrn$trades=0
+    
+     ARseries=as.numeric(m[,1])
+     ARvolume=as.numeric(m[,2])
+     
+    isAroundMean <- 1
+    for (i in l:dim(rtrn)[1]){
+         mu=mean(ARseries[(i-(l-1)):i])
+         sd.vol=sd(ARvolume[(i-(l-1)):i]);#print(sd.vol)
+         diff.vol=abs(ARvolume[i]-ARvolume[i-1]);#print(diff.vol)
+         
+         score=0
+         if(ARseries[i]>(mu*w)) score=-1
+         else if(ARseries[i]<((1/w)*mu)) score=1
+
+        #3 conditions of whether to trade or not
+        if (i > l){rtrn$states[i]=rtrn$states[i-1]}
+        if (isAroundMean && (i==l||rtrn$states[i-1]==0)) {
+            if (abs(score) == 1) rtrn$trades[i]=1
+            if (score == 1){
+                 if(diff.vol/sd.vol>1.8){rtrn$states[i]=1.5*amount}
+                 else rtrn$states[i]=amount
+            } 
+            else if (score == -1){
+                 if(diff.vol/sd.vol>1.8){rtrn$states[i]=1.5*-amount}
+                 else rtrn$states[i]=-amount
+            }
+          }
+        else if (rtrn$states[i-h]!=0){
+              if(abs(score)!=1){
+                   rtrn$trades[i]=1
+                   rtrn$states[i]=0
+              }
+         }
+        #update cash and PNL
+        if (i==l) rtrn$cash[i] <- 500 - ARseries[i] * rtrn$states[i]
+        else rtrn$cash[i] <- rtrn$cash[i-1] - ARseries[i] * (rtrn$states[i] - rtrn$states[i-1])
+        rtrn$PNL[i] <- rtrn$cash[i] + rtrn$states[i] * ARseries[i]
+        if (abs(score) <= 1) isAroundMean <- 1
+        else isAroundMean <- 0
+    }
+    if(rslt=="plot"){
+         return(rtrn)
+         #list(ARseries = ARseries, trades = trades, 
+         #     states = states, cash = cash, PNL = PNL)
+    }
+    else{
+         return(rtrn$PNL[i])
+    }
+}
+
+es.ma.v=gen_ma_w_v(cbind(es.p,es.vol)[paste0(start.date,"/",end.date)])
+es.bst.v=es.ma.v[which.max(es.ma.v[,4]),];es.bst.v #ma=10, w=1.01, h=2, pnl=47,720
+es.ma.v.plot=ma_w_v(cbind(es.p,es.vol)[paste0(start.date,"/",end.date)],l=10,w=1.01,h=2,100,rslt="plot")
+
+par(mfrow=c(1,1))
+plot(es.ma.v.plot$PNL,col="blue",type="l",main="pnl with and w/out vol signal")
+lines(es.ma.plot$PNL,col="red")
+
+```
+
+Finally, I fit an ARIMA model to the stationary price and volume series. In the interest of full disclosure, this was done to conform to the question stem. The ARIMA fit was not used in the model. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=7,fig.width=7}
+
+# fit arima models
+fit_arima_models=function(x,ar.order=NULL,res="summary"){
+     x=as.numeric(x)
+     best.ar.lag=0;best.ma.lag=0
+     beg.ctr=1;end.ctr=7
+     for(i in beg.ctr:end.ctr){
+          #arima.fit=arima(x,order=c(i,0,i))
+          if(is.null(ar.order)){arima.fit=arima(x,order=c(i,0,i))}
+          else{arima.fit=arima(x,order=c(ar.order,0,i))}
+          aic.stat=arima.fit$aic
+          
+          if(i==beg.ctr){
+               best.ar.lag=i
+               #best.box=box.stat
+               best.aic=aic.stat
+               best.model=arima.fit
+          }
+          else if(aic.stat < best.aic){
+               best.ar.lag=i
+               #best.box=box.stat
+               best.aic=aic.stat
+               best.model=arima.fit
+          }
+     }
+     if(res=="summary"){return(summary(best.model))}
+     else{return(best.model)}
+}
+
+ar.p=fit_arima_models(diff(log(es.p)),NULL,"fit");ar.p
+ar.vol=fit_arima_models(diff(log(es.vol)),NULL,"fit");ar.vol
+
+
+```
